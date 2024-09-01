@@ -69,3 +69,103 @@ class GitRepository(object):
 def repo_path(repo, *path):
     """Compute path under repo's gitdir."""
     return os.path.join(repo.gitdir, *path)
+
+def repo_file(repo, *path, mkdir=False):
+    """Same as repo_path, but create dirname(*path) if absent.  For
+example, repo_file(r, \"refs\", \"remotes\", \"origin\", \"HEAD\") will create
+.git/refs/remotes/origin."""
+
+    if repo_dir(repo, *path[:-1], mkdir=mkdir):
+        return repo_path(repo, *path)
+
+def repo_dir(repo, *path, mkdir=False):
+    """Same as repo_path, but mkdir *path if absent if mkdir."""
+
+    path = repo_path(repo, *path)
+
+    if os.path.exists(path):
+        if (os.path.isdir(path)):
+            return path
+        else:
+            raise Exception("Not a directory %s" % path)
+
+    if mkdir:
+        os.makedirs(path)
+        return path
+    else:
+        return None
+
+
+def repo_create(path):
+    """create a new repository at path"""
+    
+    repo = GitRepository(path,True)
+    
+    # first make sure path is empty or doesn't exist
+    
+    if os.path.exists(repo.worktree):
+        if not os.path.isdir(repo.worktree):
+            raise Exception ("%s is not a directory!" % path)
+        if os.path.exists(repo.gitdir) and os.listdir(repo.gitdir):
+            raise Exception("%s is not empty!" % path)
+    else:
+        os.makedirs(repo.worktree)
+        
+    
+    assert repo_dir(repo, "branches", mkdir=True)
+    assert repo_dir(repo, "objects", mkdir=True)
+    assert repo_dir(repo, "refs", "tags", mkdir=True)
+    assert repo_dir(repo, "refs", "heads", mkdir=True)
+    
+    # .git/description
+    with open(repo_file(repo, "description"), "w") as f:
+        f.write("Unnamed repository: edit this file 'description' to name this repository.\n")
+    
+    # .git/Head
+    with open(repo_file(repo,"HEAD"),'w') as f:
+        f.write('ref: refs/heads/master\n')
+        
+    with open(repo_file(repo,"config"), 'w') as f:
+        config = repo_default_config()
+        config.write(f)
+    
+    return repo
+
+def repo_find(path=".", required=True):
+    path = os.path.realpath(path)
+    
+    if os.path.isdir(os.path.join(path, ".git")):
+        return GitRepository(path)
+
+    # if we haven't returned, recurse in the parent if w
+    parent = os.path.realpath(os.path.join(path,".."))
+    
+    if parent == path:
+        # Bottom case
+        # os.path.join("/", "..") == "/":
+        # If parent==path, then path is root.
+        if required:
+            raise Exception("No git directory.")
+        else:
+            return None
+    
+    # recursive case
+    return repo_find(parent,required)
+
+def repo_default_config():
+    ret = configparser.ConfigParser()
+    
+    ret.add_section("core")
+    ret.set("core", "repositoryformatversion", "0")
+    ret.set("core", "filemode", "false")
+    ret.set("core", "bare", "false")
+
+    return ret
+
+
+argsp = argsubparsers.add_parser('init', help="Initiate a new, empty repository")
+argsp.add_argument("path", metavar='directory',nargs='?',default=".",help="Where to create the repository")
+
+def cmd_init(args):
+    repo_create(args.path)
+
