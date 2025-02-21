@@ -14,6 +14,7 @@ import zlib
 argparser = argparse.ArgumentParser(description="Unendlichs' content tracker")
 
 argsubparsers = argparser.add_subparsers(title="Commands", dest="command")
+argsubparsers.required  = True
 
 def main(argv=sys.argv[1:]):
     args = argparser.parse_args(argv)
@@ -163,8 +164,94 @@ def repo_default_config():
     return ret
 
 
+
+class GitObject (object):
+    def __init__(self,data=None):
+        if data != None:
+            self.deserialize(data)
+        else:
+            self.init()
+            
+    def init(self):
+        pass
+    
+    def deserialize(self,data):
+        raise NotImplementedError
+    def serialize(self,repo):
+        raise NotImplementedError
+    
+class GitBlob(GitObject):
+    fmt=b'blob'
+    
+    def serialize(self):
+        return self.blobData
+    
+    def deserialize(self,data):
+        self.blobData = data
+    
+def object_read(repo,sha):
+    """Read object sha from Git repository repo.  Return a
+    GitObject whose exact type depends on the object."""
+    
+    path = repo_file(repo, 'objects', sha[0:2],sha[2:])
+    
+    if not os.path.isfile(path):
+        return None
+    
+    with open(path,'rb') as f:
+        raw = zlib.decompress(f.read())
+        
+        # read object type
+        x = raw.find(b' ')
+        fmt = raw[0:x]
+        
+        # read and validate object size
+        y = raw.find(b'\x00', x)
+        size = int(raw[x:y].decode('ascii'))
+        if size != len(raw) - y - 1 :
+            raise Exception(f"Malformed object {sha}: bad length")
+        
+        match fmt:
+            case b'commit' : c=GitCommit
+            case b'tree'   : c=GitTree
+            case b'tag'    : c=GitTag
+            case b'blob'   : c=GitBlob
+            case _:
+                raise Exception(f"Unknown type {fmt.decode("ascii")} for object {sha}")
+            
+            # call constructor and return object
+        return c(raw[y+1:])
+
+def object_write(obj,repo=None):
+    data = obj.serialize()
+    
+    # add header
+    result = obj.fmt + b' ' + str(len(data)).encode() + b'\x00' + data
+    
+    # compute hash
+    sha = hashlib.sha1(result).hexdigest()
+    
+    if repo:
+        # compute path
+        path = repo_file(repo,'objects', sha[0:2], sha[2:], mkdir=True)
+        
+        if not os.path.exists(path):
+            with open(path, 'wb') as f:
+                # compress and write
+                f.write(zlib.compress(result))
+    return sha
+
+
+
+# init repo
 argsp = argsubparsers.add_parser('init', help="Initiate a new, empty repository")
 argsp.add_argument("path", metavar='directory',nargs='?',default=".",help="Where to create the repository")
+
+# add cat-file command
+argsp = argsubparsers.add_parser('cat-file', help="Provide content of objects in a repository")
+argsp.add_argument("type", metavar='type', choices=['blob','commit','tag','tree'] ,help="Speccify Type of object to retrieve")
+argsp.add_argument('object', metavar='object', help="Object to display")
+
 
 def cmd_init(args):
     repo_create(args.path)
