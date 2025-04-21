@@ -188,7 +188,17 @@ class GitBlob(GitObject):
     
     def deserialize(self,data):
         self.blobData = data
+
+class GitCommit(GitObject):
+    fmt=b'commit'
     
+    def deserialize(self, data):
+        self.kvlm = kvlm_parse(data)
+    def serialize(self, repo):
+        return kvlm_serialize(self.kvlm)
+    def init(self):
+        self.kvlm = dict()
+        
 def object_read(repo,sha):
     """Read object sha from Git repository repo.  Return a
     GitObject whose exact type depends on the object."""
@@ -241,6 +251,97 @@ def object_write(obj,repo=None):
                 f.write(zlib.compress(result))
     return sha
 
+def object_hash(fd, fmt, repo=None):
+    """Hash object, writing it to the repo if provided"""
+    data = fd.read()
+    
+    # choose constructor base on the fmt argument
+    match fmt:
+        case b'commit' : obj = GitCommit(data)
+        case b'tag' : obj = GitTag(data)
+        case b'tree' : obj = GitTree(data)
+        case b'blob' : obj = GitBlob(data)
+        case _: raise Exception(f"Unknown format: {fmt}!")
+        
+    return object_write(obj,repo)
+
+
+def kvlm_parse(raw,start=0,dct = None):
+    if not dct:
+        dct = {}
+        # you cannot declare the argument as dct = dict() or all call to 
+        # the functions will endlessly grow the same dict
+        
+    # this function is recursive: it reads a key/value pair, then call 
+    # itself again with the new position. so we first need to know,
+    # where we are: at a keyword, or already in a messageQ
+    
+    # we search for the next space and the next newline.
+    spc = raw.find(b' ', start)
+    nl = raw.find(b'\n', start)
+    
+    # if the space appear before newline, we have a keyword. otherwise,
+    # it's the final message, which we just read to the end of the file.
+    
+    # Base case
+    # ===========================
+    # if newline appears first (or there's no space at all, in which
+    # case find returns -1), we assume a blank line. a blank line meands
+    # means the remainder of the data is the message. we store it in the 
+    # dictionary, None as the key, and return
+    
+    if (spc < 0) or (nl < spc):
+        assert nl == start
+        dct[None] = raw[start+1:]
+        return dct
+    
+    # recursive case
+    # =============
+    # we read the key/value pair and recurse for the next
+    key = raw[start:spc]
+    
+    
+    # find the end of the value. Continuation lines begin with a space
+    # so we loop until a '\n' not followed by a space
+    end = start
+    while True:
+        end = raw.find(b'\n', end + 1)
+        if raw[end+1] != ord(' '): break
+        
+    # grab the value
+    # also, drop the leading space on continuation lines
+    value = raw[spc+1:end].replace(b'\n ', b'\n')
+    
+    # don't overwrite the existing data contents
+    if key in dct:
+        if type(dct[key]) == list:
+            dct[key].append(value)
+        else:
+            dct[key] = [dct[key], value]
+    else:
+        dct[key] = value
+        
+    return kvlm_parse(raw, start=end+1,dct=dct)
+
+def kvlm_serialize(kvlm):
+    ret = b''
+    
+    # output fields
+    for k in kvlm.keys():
+        # skip the message itself
+        if k == None: continue
+        val = kvlm[k]
+        
+        if type(val) != list:
+            val = [val]
+        for v in val:
+            ret += k + b' ' + (v.replace(b'\n', b'\n ')) + b'\n'
+    
+    ret += b'\n' + kvlm[None]
+    
+    return ret
+        
+    
 
 
 # init repo
@@ -252,6 +353,19 @@ argsp = argsubparsers.add_parser('cat-file', help="Provide content of objects in
 argsp.add_argument("type", metavar='type', choices=['blob','commit','tag','tree'] ,help="Speccify Type of object to retrieve")
 argsp.add_argument('object', metavar='object', help="Object to display")
 
+
+# hash object arg added 
+argsp = argsubparsers.add_parser('hash-object', help='Compute object ID and optionally creates a blob from a file')
+
+argsp.add_argument("-t", metavar='type', choices=['blob','commit','tag','tree'] ,help="Speccify the type")
+
+argsp.add_argument('-w',dest='write',action="store_true", help="Actually write the object into the database")
+
+argsp.add_argument('path', help='Read object from <file>')
+
+# log
+argsp = argsubparsers.add_parser('log',help="Display the history of a given commit.")
+argsp.add_argument("commit", default="Head", nargs='?', help="Commit to start at.")
 
 def cmd_init(args):
     repo_create(args.path)
@@ -265,5 +379,52 @@ def cat_file(repo, obj, fmt=None):
     
 def object_find(repo,name,fmt=None,follow=True):
     return None
+
+def cmd_hash_object(args):
+    if args.write:
+        repo = repo_find()
+    else:
+        repo = None
     
+    with open(args.path, "rb") as fd:
+        sha = object_hash(fd,args.type.encode(), repo)
+        print(sha)
+
+        
+def cmd_log(args):
+    repo = repo_find()
+    
+    print("digraph wyaglog{")
+    print(" Node[shape=rect]")
+    log_graphviz(repo,object_find(repo,args.commit), set())
+    print("}")
+    
+def log_graphviz(repo,sha,seen):
+    if sha in seen:
+        return 
+    seen.add(sha)
+    
+    commit = object_read(repo,sha)
+    message = commit.kvlm[None].decode('utf8').strip()
+    message = message.replace("\\","\\\\")
+    message = message.replace("\"","\\\"")
+    
+    
+    if "\n" in message:
+        message = message[:message.index("\n")]
+    
+    print(f" c_{sha} [label=\"{sha[0:7]}: {message}\"]")
+    assert commit.fmt ==b'commit'
+    
+    if not b'parent' in commit.kvlm.keys():
+        # base case: the inital commit
+        return
+    
+    parents = commit.kvlm[b'parent']
+    if type(parents) != list:
+        parents = [parents]
+    for p in parents:
+        p = p.decode('ascii')
+        print(f" c_{sha} -> c_{p};")
+        log_graphviz(repo,p,seen)
 
