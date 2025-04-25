@@ -217,6 +217,9 @@ class GitTree(GitObject):
     def init(self):
         self.items = list()
 
+class GitTag(GitObject):
+    fmt=b'tag'
+
 
 def tree_parse_one(raw,start=0):
     # find the space terminator of the mode
@@ -413,7 +416,117 @@ def kvlm_serialize(kvlm):
     
     return ret
         
+
+def ref_resolve(repo, ref):
+    path = repo_file(repo, ref)
     
+    # Sometimes, an indirect reference may be broken. This is normal
+    # in one specific case: we're looking for HEAD on a new repository
+    # with no commits. In that case, .git/HEAD points to 
+    # "ref: refs/heads/main". but .git/refs/heads/main doesn't exist
+    # yet (since there's no commit for it refer to).
+    if not os.path.isfile(path):
+        return None
+    
+    with open(path, 'r') as fp:
+        data = fp.read()[:-1]
+        # drop final \n ^^^^^
+    if data.startswith("ref: "):
+        return ref_resolve(repo, data[5:])
+    else:
+        return data
+
+def ref_list(repo,path=None):
+    if not path:
+        path = repo_dir(repo, "refs")
+    
+    ret = dict()
+    # Git show refs sorted. To do the same, we sort the output of listdir
+    for f in sorted(os.listdir(path)):
+        can = os.path.join(path, f)
+        if os.path.isdir(can):
+            ret[f] = ref_list(repo,can)
+        else:
+            ret[f] = ref_resolve(repo,can)
+    return ret
+
+def object_resolve(repo, name):
+    """Resolve name to an object hash in repo
+    This function is aware of:
+    
+    -the HEAD literal
+    - short and long hashed
+    - tags
+    - branches
+    - remote branches
+    """
+    
+    candidates = list()
+    hashRe = re.compile(r"^[0-9A-Fa-f]{4,40}$")
+    
+    # Empty string? Abort.
+    if not name.strip():
+        return None
+    
+    # HEAD is nonambiguos
+    if name == "HEAD":
+        return [ ref_resolve(repo, 'HEAD')]
+    
+    # if it's a hex string. try for a hash
+    if hashRe.match(name):
+        # this may be a hash, either small or full. 4 seems to be the 
+        # minimal length for git to consider something a short hash.
+        # This limit is documented in man git-rev-parse
+        name = name.lower()
+        prefix = name[0:2]
+        path = repo_dir(repo, "objects", prefix, mkdir=False)
+        if path:
+            rem = name[2:]
+            for f in os.listdir(path):
+                if f.startswith(rem):
+                    candidates.append(prefix+f)
+        
+    # Try for references.
+    as_tag = ref_resolve(repo, "refs/tags/" + name)
+    if as_tag: #did we find a tag?
+        candidates.append(as_tag)
+        
+    as_branch = ref_resolve(repo, "refs/heads/" + name)
+    if as_branch: #did we find a branch?
+        candidates.append(as_branch)
+        
+    return candidates
+
+def object_find(repo, name, fmt=None, follow=True):
+    sha = object_resolve(repo, name)
+    
+    if not sha:
+        raise Exception(f"No such reference {name}.")
+    
+    if len(sha) > 1:
+        raise Exception(f"Ambiguos reference {name}: Candidates are:\n - {'\n - '.join(sha)}.")
+    
+    sha = sha[0]
+    
+    if not fmt:
+        return sha
+    
+    while True:
+        obj = object_read(repo, sha)
+        
+        if obj.fmt == fmt:
+            return sha
+        
+        if not follow:
+            return None
+        
+        # follo tags
+        if obj.fmt == b'tag':
+            sha = obj.kvlm[b'object'].decode("ascii")
+        elif obj.fmt == b'commit' and fmt == b'tree':
+            sha = obj.kvlm[b'tree'].decode("ascii")
+        else:
+            return None
 
 
 # init repo
@@ -450,6 +563,20 @@ argsp = argsubparsers.add_parser("checkout", help="Checkout a commit inside of a
 argsp.add_argument("commit", help="The commit or tree to checkout.")
 argsp.add_argument("path", help="The Empty directory to checkout on.")
 
+# show-ref
+argsp = argsubparsers.add_parser("show-ref", help="List references.")
+
+# tag
+argsp = argsubparsers.add_parser("tag", help="List and create tags")
+argsp.add_argument("-a", action="store_true", dest="create_tag_object", help="Whether to create a tag object")
+argsp.add_argument("name", nargs="?", help="The new tag's name")
+argsp.add_argument("object", default="HEAD", nargs="?", help="The object the new tag will point to")
+
+# rev-parse
+argsp = argsubparsers.add_parser('rev-parse', help="Parse revision (or other objects) identifiers")
+argsp.add_argument("--wyag-type", metavar='type', dest="type", choices=["blob", "commit", "tag", "tree"], default=None, help="Specify the expected type")
+argsp.add_argument("name", help='The name to parse')
+
 def cmd_init(args):
     repo_create(args.path)
 
@@ -459,9 +586,6 @@ def cmd_cat_file(args):
 
 def cat_file(repo, obj, fmt=None):
     obj = object_read(repo, object_find(repo,obj,fmt=fmt))
-    
-def object_find(repo,name,fmt=None,follow=True):
-    return None
 
 def cmd_hash_object(args):
     if args.write:
@@ -570,3 +694,67 @@ def tree_checkout(repo, tree,path):
             # @TODO Support symlinks (identified by mode 12****)
             with open(dest, 'wb') as f:
                 f.write(obj.blobData)
+
+
+def cmd_show_ref(args):
+    repo = repo_find()
+    refs = ref_list(repo)
+    
+    show_ref(repo, refs, prefix="refs")
+
+def show_ref(repo, refs, with_hash=True, prefix=""):
+    if prefix:
+        prefix = prefix + "/"
+    for k, v in refs.items():
+        if type(v) == str and with_hash:
+            print(f"{v} {prefix}{k}")
+        elif type(v) == str:
+            print(f"{prefix}{k}")
+        else:
+            show_ref(repo, v, with_hash=with_hash, prefix=f"{prefix}{k}")
+            
+            
+def cmd_tag(args):
+    repo = repo_find()
+    
+    if args.name:
+        tag_create(repo, args.name, args.object, create_tag_object = args.create_tag_object)
+    else:
+        refs = ref_list(repo)
+        show_ref(repo, refs["tags"], with_hash=False)
+
+def tag_create(repo, name, ref, create_tag_object=False):
+    # get the GitObject from the object reference
+    sha = object_find(repo, ref)
+    
+    if create_tag_object:
+        #  create tag object (commit)
+        tag = GitTag()
+        tag.kvlm = dict()
+        tag.kvlm[b'object'] = sha.encode()
+        tag.kvlm[b'type'] = b'commit'
+        tag.kvlm[b"tag"] = name.encode()
+        # Feel free to let the user give their name!
+        # Notice you can fix this after commit, read on!
+        tag.kvlm[b'tagger'] = b'Ggit <ggit@example.com>'
+        # ...and a tag message!
+        tag.kvlm[None] = b"A tag generated by ggit, which won't let you customize the message!\n"
+        tag_sha = object_write(tag, repo)
+        # create reference
+        ref_create(repo, "tags/" + name, tag_sha)
+    else:
+        # create lightweight tag (ref)
+        ref_create(repo, "tags/" + name, sha)
+        
+def ref_create(repo, ref_name,sha):
+    with open(repo_file(repo, "refs/" + ref_name), 'w') as fp:
+        fp.write(sha + "\n")
+
+def cmd_rev_parse(args):
+    if args.type:
+        fmt = args.type.encode()
+    else:
+        fmt = None
+    
+    repo = repo_find()
+    print(object_find(repo,args.name,fmt,follow=True))
